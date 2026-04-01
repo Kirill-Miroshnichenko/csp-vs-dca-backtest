@@ -1,0 +1,27 @@
+# Data files — do not commit (too large)
+data/
+*.parquet
+*.csv
+
+# But include the sample file for testing
+!data/sample.parquet
+
+# Output charts
+*.png
+*.jpg
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+venv/
+.venv/
