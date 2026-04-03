@@ -31,18 +31,7 @@ The script expects Parquet files with minute-bar options data from Deribit with 
 | `underlying_price` | float | ETH/USD spot price |
 | `days_to_expiration` | float | Days until expiry |
 
-### Quick start with sample data
-
-A sample file (`data/sample.parquet`) is included — 2 weeks of ETH options data (January 2024). To run the backtest on it:
-
-```python
-# In backtest.py, uncomment this line:
-DATA_FILES = [DATA_DIR / "sample.parquet"]
-```
-
-Expected output: 2 cycles, both worthless (no assignment).
-
-### Where to get full data
+### Where to get data
 
 - [Deribit API](https://docs.deribit.com/) — historical options data
 - [Tardis.dev](https://tardis.dev/) — normalized Deribit tick data (paid)
