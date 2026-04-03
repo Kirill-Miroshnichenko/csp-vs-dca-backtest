@@ -1,492 +1,695 @@
-"""
-ETH Options Backtest: DCA vs Cash-Secured Put Selling
-======================================================
-Compares two ETH accumulation strategies over historical Deribit options data.
+# =============================================================================
+# Cash-Secured Put (CSP) vs DCA — ETH Options Backtest
+# =============================================================================
+#
+# Strategy 1: DCA — periodic ETH purchases at fixed USD amount
+# Strategy 2: Cash-Secured Put (CSP) — systematically sell puts to collect
+#             premiums and accumulate ETH on assignment
+#
+# Data format (Parquet, minute bars from Deribit):
+#   timestamp               — datetime64[ns, UTC]
+#   instrument_name         — str, e.g. "ETH-28JUN24-2200-P"
+#   expiration_timestamp    — datetime64[ns, UTC], expiry at 08:00 UTC
+#   strike                  — float, strike price in USD
+#   option_type             — str, "put" / "call"
+#   mark_price              — float, in ETH (multiply by underlying_price for USD)
+#   underlying_price        — float, ETH/USD spot price
+#   days_to_expiration      — float, days until expiry
+#
+# Usage:
+#   1. Place your Parquet files in DATA_DIR (or update DATA_FILES list)
+#   2. Adjust strategy parameters in the CONFIG section
+#   3. Run: python backtest.py
+# =============================================================================
 
-Strategy A — DCA:
-    Buy ETH with a fixed USD amount every week at market price.
-
-Strategy B — Put Selling:
-    Every week, sell a cash-secured put at a chosen strike (ATM / 10% OTM / 20% OTM).
-    - If assigned (price < strike at expiry): receive ETH at strike price, premium kept.
-    - If not assigned (price > strike at expiry): keep premium, reinvest next cycle.
-
-Usage:
-    python backtest.py --data_dir ./data --weekly_budget 200 --strikes atm otm10 otm20
-
-Requirements:
-    pip install pandas numpy matplotlib seaborn tqdm
-"""
-
-import os
-import warnings
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
-
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import numpy as np
 import pandas as pd
-import seaborn as sns
+import numpy as np
+from pathlib import Path
 
-warnings.filterwarnings("ignore")
+# -----------------------------------------------------------------------------
+# DATA PATHS — update these to point to your data files
+# -----------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+DATA_DIR = Path("data")           # folder containing Parquet files
 
-@dataclass
-class BacktestConfig:
-    data_dir: str = "./data"
-    weekly_budget_usd: float = 200.0          # USD invested per week in DCA
-    expiry_days_target: int = 7               # target DTE when entering put (7 = weekly)
-    expiry_days_tolerance: int = 3            # ± days tolerance for finding the right expiry
-    strikes: list = field(default_factory=lambda: ["atm", "otm10", "otm20"])
-    deribit_fee_rate: float = 0.0003          # 0.03% of underlying per option contract
-    sell_hour_utc: int = 9                    # hour to enter new position after expiry (UTC)
-    output_dir: str = "./results"
-    plot: bool = True
+# List your Parquet files here in chronological order
+DATA_FILES = [
+    DATA_DIR / "eth_options_part1.parquet",
+    DATA_DIR / "eth_options_part2.parquet",
+    DATA_DIR / "eth_options_part3.parquet",
+    DATA_DIR / "eth_options_part4.parquet",
+]
 
+# To run on the included sample file (2 weeks of data for testing):
+# DATA_FILES = [DATA_DIR / "sample.parquet"]
 
-# ---------------------------------------------------------------------------
-# Data Loading
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# STRATEGY PARAMETERS — edit here
+# -----------------------------------------------------------------------------
 
-def load_data(config: BacktestConfig) -> pd.DataFrame:
-    """Load all parquet/csv files from data_dir and return a clean DataFrame."""
-    data_path = Path(config.data_dir)
-    files = sorted(list(data_path.glob("*.parquet")) + list(data_path.glob("*.csv")))
+# --- General ---
+INITIAL_CAPITAL_USD = 11_200       # starting capital in USD
 
-    if not files:
-        raise FileNotFoundError(f"No parquet or csv files found in {config.data_dir}")
+# --- CSP: expiry selection ---
+TARGET_DTE    = 7                   # target days to expiration
+DTE_TOLERANCE = 3                   # tolerance ± days: selects expiry in [TARGET_DTE ± DTE_TOLERANCE]
 
-    print(f"Loading {len(files)} file(s)...")
-    dfs = []
+# --- CSP: strike selection ---
+# STRIKE_MONEYNESS = 1.00 → ATM
+# STRIKE_MONEYNESS = 0.95 → 5%  OTM
+# STRIKE_MONEYNESS = 0.90 → 10% OTM
+# STRIKE_MONEYNESS = 0.85 → 15% OTM
+STRIKE_MONEYNESS = 0.85
+
+# --- CSP: position size ---
+# Deribit minimum lot size for ETH options = 0.1 ETH
+LOT_SIZE = 0.2
+
+# --- Fees ---
+# Deribit taker fee: 0.03% of underlying, capped at 12.5% of premium
+WHEEL_FEE_OPEN_RATE     = 0.0003   # fee on opening (selling) the put
+WHEEL_FEE_DELIVERY_RATE = 0.00015  # delivery fee on assignment
+DCA_FEE_RATE            = 0.001    # spot purchase fee (typical taker)
+
+# --- DCA ---
+DCA_INTERVAL   = "weekly"          # "weekly" or "monthly"
+DCA_AMOUNT_USD = 100               # USD amount per purchase
+
+# -----------------------------------------------------------------------------
+# COLUMNS NEEDED — reduces memory usage on load
+# -----------------------------------------------------------------------------
+
+NEEDED_COLUMNS = [
+    "timestamp",
+    "instrument_name",
+    "expiration_timestamp",
+    "strike",
+    "option_type",
+    "mark_price",           # in ETH — multiply by underlying_price for USD
+    "underlying_price",     # ETH/USD spot price
+    "days_to_expiration",
+]
+
+# -----------------------------------------------------------------------------
+# STEP 1: DATA LOADING
+# -----------------------------------------------------------------------------
+
+def load_puts_only(files: list[Path]) -> pd.DataFrame:
+    """
+    Loads put options filtered to the relevant DTE window.
+
+    Filters applied per file to minimize memory usage:
+    1. option_type == "put"
+    2. mark_price > 0  (zero-premium rows are useless)
+    3. days_to_expiration in [TARGET_DTE - DTE_TOLERANCE, TARGET_DTE + DTE_TOLERANCE]
+       → drops ~90% of rows with irrelevant expiries
+    4. Downcast float64 → float32 (~2x memory saving)
+
+    Result: from ~300M rows to ~5-15M — fits in 16GB RAM.
+    """
+    dte_min = TARGET_DTE - DTE_TOLERANCE
+    dte_max = TARGET_DTE + DTE_TOLERANCE
+
+    chunks = []
     for f in files:
-        print(f"  {f.name}")
-        if f.suffix == ".parquet":
-            dfs.append(pd.read_parquet(f))
-        else:
-            dfs.append(pd.read_csv(f))
+        print(f"  Loading {f.name}...")
+        df = pd.read_parquet(f, columns=NEEDED_COLUMNS)
+        before = len(df)
 
-    df = pd.concat(dfs, ignore_index=True)
+        df = df[df["option_type"] == "put"]
+        df = df[
+            (df["days_to_expiration"] >= dte_min) &
+            (df["days_to_expiration"] <= dte_max)
+        ]
+        df = df[df["mark_price"] > 0].copy()
 
-    # Parse timestamps
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df["expiration_timestamp"] = pd.to_datetime(df["expiration_timestamp"], utc=True)
+        float_cols = ["mark_price", "underlying_price", "strike", "days_to_expiration"]
+        df[float_cols] = df[float_cols].astype("float32")
+        df["mark_price_usd"] = df["mark_price"].astype("float64") * df["underlying_price"].astype("float64")
 
-    # Keep only puts with valid data
-    df = df[df["option_type"] == "put"].copy()
-    df = df[df["mark_price"] > 0].copy()
-    df = df.sort_values("timestamp").reset_index(drop=True)
+        after = len(df)
+        ratio = after / before * 100 if before > 0 else 0
+        mem   = df.memory_usage(deep=True).sum() / 1024**2
+        print(f"    → {before:,} rows → {after:,} after filtering ({ratio:.1f}%) | {mem:.0f} MB")
+        chunks.append(df)
+        del df
 
-    print(f"Loaded {len(df):,} put option rows")
-    print(f"Date range: {df['timestamp'].min().date()} → {df['timestamp'].max().date()}")
-    print(f"Underlying price range: ${df['underlying_price'].min():,.0f} – ${df['underlying_price'].max():,.0f}")
+    data = pd.concat(chunks, ignore_index=True)
+    del chunks
+    data = data.sort_values("timestamp").reset_index(drop=True)
+
+    total_mem = data.memory_usage(deep=True).sum() / 1024**3
+    print(f"\nTotal: {len(data):,} rows | {total_mem:.2f} GB in memory")
+    print(f"Range: {data['timestamp'].min()} → {data['timestamp'].max()}")
+    return data
+
+
+def load_spot_series(files: list[Path]) -> pd.DataFrame:
+    """
+    Loads ETH spot price series independently of the DTE filter.
+    Used for DCA so purchases are not affected by option data availability.
+    """
+    chunks = []
+    for f in files:
+        df = pd.read_parquet(f, columns=["timestamp", "underlying_price", "option_type"])
+        df = df[df["option_type"] == "put"][["timestamp", "underlying_price"]]
+        chunks.append(df.drop_duplicates("timestamp"))
+        del df
+
+    spot = (
+        pd.concat(chunks)
+        .drop_duplicates("timestamp")
+        .set_index("timestamp")
+        .sort_index()
+    )
+    del chunks
+    print(f"  Spot series: {len(spot):,} bars | {spot.index.min()} → {spot.index.max()}")
+    return spot
+
+
+def get_expiry_schedule(df: pd.DataFrame) -> pd.Series:
+    """Returns all unique expiration timestamps found in the data."""
+    expiries = (
+        df["expiration_timestamp"]
+        .drop_duplicates()
+        .sort_values()
+        .reset_index(drop=True)
+    )
+    print(f"\nUnique expiries in data: {len(expiries)}")
+    print(f"First 5: {expiries.head().tolist()}")
+    print(f"Last 5:  {expiries.tail().tolist()}")
+    return expiries
+
+
+# -----------------------------------------------------------------------------
+# STEP 2: CONTRACT SELECTION
+# -----------------------------------------------------------------------------
+
+def select_contract(
+    puts: pd.DataFrame,
+    open_ts: pd.Timestamp,
+    spot: float,
+    target_dte: int    = TARGET_DTE,
+    dte_tolerance: int = DTE_TOLERANCE,
+    moneyness: float   = STRIKE_MONEYNESS,
+) -> dict | None:
+    """
+    Selects one put contract at open_ts:
+
+    1. Expiry selection: find all available expiries at open_ts,
+       keep those within [target_dte ± dte_tolerance] days,
+       pick the one closest to target_dte.
+
+    2. Strike selection: target_strike = spot * moneyness,
+       pick the available strike closest to target_strike.
+
+    Returns a dict with contract details, or None if no suitable contract found.
+    """
+    snapshot = puts[puts["timestamp"] == open_ts].copy()
+    if snapshot.empty:
+        return None
+
+    dte_min = target_dte - dte_tolerance
+    dte_max = target_dte + dte_tolerance
+
+    available_expiries = snapshot["expiration_timestamp"].unique()
+    dte_map = {
+        exp: (exp - open_ts).total_seconds() / 86400
+        for exp in available_expiries
+    }
+
+    valid = {exp: dte for exp, dte in dte_map.items() if dte_min <= dte <= dte_max}
+    if not valid:
+        return None
+
+    chosen_expiry = min(valid, key=lambda exp: abs(valid[exp] - target_dte))
+    actual_dte    = valid[chosen_expiry]
+
+    target_strike = spot * moneyness
+    candidates    = snapshot[snapshot["expiration_timestamp"] == chosen_expiry].copy()
+    if candidates.empty:
+        return None
+
+    candidates["strike_dist"] = (candidates["strike"] - target_strike).abs()
+    best = candidates.loc[candidates["strike_dist"].idxmin()]
+
+    return {
+        "open_ts":          open_ts,
+        "instrument_name":  best["instrument_name"],
+        "expiration_ts":    chosen_expiry,
+        "actual_dte":       round(actual_dte, 2),
+        "strike":           best["strike"],
+        "target_strike":    round(target_strike, 2),
+        "spot_at_open":     spot,
+        "underlying_price": spot,
+        "premium_eth":      best["mark_price"],
+        "premium_usd":      best["mark_price_usd"],
+    }
+
+
+# -----------------------------------------------------------------------------
+# STEP 3: CSP BACKTEST LOOP
+# -----------------------------------------------------------------------------
+
+def build_csp_pnl(puts: pd.DataFrame, spot_series: pd.DataFrame) -> pd.DataFrame:
+    """
+    Runs the Cash-Secured Put backtest cycle by cycle:
+      open position → wait for expiry → open next position → ...
+
+    Margin rule: do not open a new put if cash < strike * LOT_SIZE.
+    If insufficient margin, wait 1 hour and retry.
+
+    P&L mechanics:
+    - cash += net_premium on open (premium received minus fee)
+    - worthless expiry: no change
+    - assigned: cash -= strike * LOT_SIZE + delivery_fee; eth += LOT_SIZE
+    - portfolio_value = cash + eth * spot_at_expiry
+    """
+    all_timestamps = puts["timestamp"].drop_duplicates().sort_values().reset_index(drop=True)
+
+    cash = float(INITIAL_CAPITAL_USD)
+    eth  = 0.0
+    current_ts = all_timestamps.iloc[0]
+    rows = []
+    skipped_no_exp    = 0
+    skipped_no_margin = 0
+
+    while True:
+        idx = all_timestamps.searchsorted(current_ts)
+        if idx >= len(all_timestamps):
+            break
+        current_ts = all_timestamps.iloc[idx]
+
+        spot_rows = puts[puts["timestamp"] == current_ts]["underlying_price"]
+        if spot_rows.empty:
+            current_ts = all_timestamps.iloc[min(idx + 1, len(all_timestamps) - 1)]
+            continue
+        spot = float(spot_rows.iloc[0])
+
+        contract = select_contract(puts, current_ts, spot)
+        if contract is None:
+            skipped_no_exp += 1
+            next_ts = current_ts + pd.Timedelta(hours=1)
+            idx2 = all_timestamps.searchsorted(next_ts)
+            if idx2 >= len(all_timestamps):
+                break
+            current_ts = all_timestamps.iloc[idx2]
+            continue
+
+        if cash < contract["strike"] * LOT_SIZE:
+            skipped_no_margin += 1
+            next_ts = current_ts + pd.Timedelta(hours=1)
+            idx2 = all_timestamps.searchsorted(next_ts)
+            if idx2 >= len(all_timestamps):
+                break
+            current_ts = all_timestamps.iloc[idx2]
+            continue
+
+        # Open position: receive premium net of fees
+        gross_premium = contract["premium_usd"] * LOT_SIZE
+        fee_open = min(
+            contract["underlying_price"] * LOT_SIZE * WHEEL_FEE_OPEN_RATE,
+            gross_premium * 0.125       # Deribit cap: max 12.5% of premium
+        )
+        net_premium = gross_premium - fee_open
+        cash += net_premium
+
+        # Wait for expiry
+        exp_ts  = contract["expiration_ts"]
+        exp_idx = all_timestamps.searchsorted(exp_ts)
+        if exp_idx >= len(all_timestamps):
+            break
+
+        actual_exp_ts = all_timestamps.iloc[exp_idx]
+        spot_exp_rows = puts[puts["timestamp"] == actual_exp_ts]["underlying_price"]
+        if spot_exp_rows.empty:
+            break
+        spot_at_exp = float(spot_exp_rows.iloc[0])
+
+        assigned = spot_at_exp < contract["strike"]
+        if assigned:
+            fee_delivery = contract["strike"] * LOT_SIZE * WHEEL_FEE_DELIVERY_RATE
+            cash -= contract["strike"] * LOT_SIZE + fee_delivery
+            eth  += LOT_SIZE
+
+        portfolio = cash + eth * spot_at_exp
+
+        rows.append({
+            "ts":              actual_exp_ts,
+            "open_ts":         contract["open_ts"],
+            "instrument":      contract["instrument_name"],
+            "actual_dte":      contract["actual_dte"],
+            "strike":          contract["strike"],
+            "spot_at_open":    contract["spot_at_open"],
+            "premium_usd":     round(net_premium, 2),
+            "fee_open":        round(fee_open, 4),
+            "assigned":        assigned,
+            "spot_at_exp":     spot_at_exp,
+            "cash":            round(cash, 2),
+            "eth":             eth,
+            "portfolio_value": round(portfolio, 2),
+        })
+
+        next_idx = exp_idx + 1
+        if next_idx >= len(all_timestamps):
+            break
+        current_ts = all_timestamps.iloc[next_idx]
+
+    df = pd.DataFrame(rows)
+    assigned_count = df["assigned"].sum()
+    print(f"\nTotal cycles:          {len(df)}")
+    print(f"Assigned (ETH):        {assigned_count} ({100*assigned_count/len(df):.1f}%)")
+    print(f"Worthless:             {len(df)-assigned_count} ({100*(1-assigned_count/len(df)):.1f}%)")
+    print(f"Skipped (no expiry):   {skipped_no_exp}")
+    print(f"Skipped (no margin):   {skipped_no_margin}")
+
+    # Append a final mark-to-market row at the last available timestamp
+    # Use spot_series (independent of DTE filter) to ensure same end date as DCA
+    last_ts   = spot_series.index[-1]
+    last_spot = float(spot_series["underlying_price"].iloc[-1])
+    last_portfolio = round(cash + eth * last_spot, 2)
+
+    if last_ts > df["ts"].iloc[-1]:
+        df = pd.concat([df, pd.DataFrame([{
+            "ts":              last_ts,
+            "open_ts":         last_ts,
+            "instrument":      "mark-to-market",
+            "actual_dte":      0,
+            "strike":          0,
+            "spot_at_open":    last_spot,
+            "premium_usd":     0,
+            "fee_open":        0,
+            "assigned":        False,
+            "spot_at_exp":     last_spot,
+            "cash":            round(cash, 2),
+            "eth":             eth,
+            "portfolio_value": last_portfolio,
+        }])], ignore_index=True)
 
     return df
 
 
-# ---------------------------------------------------------------------------
-# Strike Selection
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# STEP 4: DCA BACKTEST
+# -----------------------------------------------------------------------------
 
-def select_strike(
-    available_strikes: pd.Series,
-    current_price: float,
-    strike_mode: str,
-) -> Optional[float]:
+def calc_dca_pnl(spot_series: pd.DataFrame) -> pd.DataFrame:
     """
-    Find the closest available strike to the target.
-    strike_mode: 'atm' | 'otm10' | 'otm20'
+    Simulates DCA strategy: buy ETH at fixed USD intervals.
+    Uses an independent spot series so purchases are not affected
+    by option data availability or DTE filtering.
     """
-    targets = {
-        "atm":   current_price * 1.00,
-        "otm10": current_price * 0.90,
-        "otm20": current_price * 0.80,
-    }
-    target = targets[strike_mode]
-    if available_strikes.empty:
-        return None
-    idx = (available_strikes - target).abs().idxmin()
-    return available_strikes[idx]
+    freq = "W-FRI" if DCA_INTERVAL == "weekly" else "MS"
+    purchase_dates = spot_series.resample(freq).first().dropna()
 
+    cash = float(INITIAL_CAPITAL_USD)
+    eth  = 0.0
+    rows = []
 
-# ---------------------------------------------------------------------------
-# DCA Backtest
-# ---------------------------------------------------------------------------
+    for ts, row in purchase_dates.iterrows():
+        spot       = row["underlying_price"]
+        amount     = min(DCA_AMOUNT_USD, max(cash, 0))
+        fee_dca    = amount * DCA_FEE_RATE
+        eth_bought = (amount - fee_dca) / spot if amount > 0 else 0.0
+        cash      -= amount
+        eth       += eth_bought
 
-def run_dca(weekly_ts: pd.DatetimeIndex, price_at: dict, budget: float) -> pd.DataFrame:
-    """
-    Simple DCA: buy ETH for `budget` USD each week.
-    price_at: {timestamp -> underlying_price}
-    """
-    records = []
-    eth_total = 0.0
-    cash_spent = 0.0
-
-    for ts in weekly_ts:
-        price = price_at.get(ts)
-        if price is None or price <= 0:
-            continue
-        eth_bought = budget / price
-        eth_total += eth_bought
-        cash_spent += budget
-        records.append({
-            "date": ts,
-            "eth_bought": eth_bought,
-            "price": price,
-            "eth_total": eth_total,
-            "cash_spent": cash_spent,
-            "portfolio_usd": eth_total * price,
-            "avg_entry_price": cash_spent / eth_total,
+        rows.append({
+            "ts":              ts,
+            "spot":            spot,
+            "eth_bought":      round(eth_bought, 6),
+            "cash":            round(cash, 2),
+            "eth":             round(eth, 6),
+            "portfolio_value": round(max(cash, 0) + eth * spot, 2),
         })
 
-    return pd.DataFrame(records)
+    df = pd.DataFrame(rows)
+
+    # Append final mark-to-market row so DCA ends at the same date as CSP
+    last_ts   = spot_series.index[-1]
+    last_spot = float(spot_series["underlying_price"].iloc[-1])
+    if last_ts > df["ts"].iloc[-1]:
+        df = pd.concat([df, pd.DataFrame([{
+            "ts":              last_ts,
+            "spot":            last_spot,
+            "eth_bought":      0.0,
+            "cash":            df["cash"].iloc[-1],
+            "eth":             df["eth"].iloc[-1],
+            "portfolio_value": round(max(df["cash"].iloc[-1], 0) + df["eth"].iloc[-1] * last_spot, 2),
+        }])], ignore_index=True)
+
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Put Selling Backtest
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# STEP 5: PRINT RESULTS
+# -----------------------------------------------------------------------------
 
-def run_put_selling(
-    df: pd.DataFrame,
-    config: BacktestConfig,
-    strike_mode: str,
-) -> pd.DataFrame:
-    """
-    Cash-secured put selling strategy.
-
-    Each cycle:
-    1. At entry timestamp, find a put expiring in ~7 days at target strike.
-    2. Sell at mark_price → collect premium in USD.
-    3. At expiry, check if assigned (underlying < strike).
-       - Assigned: buy ETH at strike, deduct fee.
-       - Not assigned: premium rolled into next cycle cash.
-    4. Track total ETH, total cash deployed, premium income.
-    """
-    records = []
-    eth_total = 0.0
-    cash_balance = config.weekly_budget_usd  # starting collateral
-    total_premiums = 0.0
-    total_fees = 0.0
-    assignments = 0
-    total_cycles = 0
-
-    # Get sorted unique timestamps (minute-level)
-    all_ts = df["timestamp"].sort_values().unique()
-
-    # Find weekly entry points (every 7 days from start)
-    start_ts = pd.Timestamp(all_ts[0])
-    end_ts = pd.Timestamp(all_ts[-1])
-
-    entry_ts = start_ts
-    while entry_ts <= end_ts:
-        total_cycles += 1
-
-        # --- 1. Find the closest timestamp in data ---
-        nearest_idx = np.searchsorted(all_ts, entry_ts)
-        if nearest_idx >= len(all_ts):
-            break
-        actual_entry_ts = pd.Timestamp(all_ts[nearest_idx])
-
-        # --- 2. Get snapshot at entry ---
-        snapshot = df[df["timestamp"] == actual_entry_ts].copy()
-        if snapshot.empty:
-            entry_ts += pd.Timedelta(days=7)
-            continue
-
-        underlying_price = snapshot["underlying_price"].iloc[0]
-
-        # --- 3. Filter puts by target DTE ---
-        target_dte = config.expiry_days_target
-        tol = config.expiry_days_tolerance
-        candidates = snapshot[
-            (snapshot["days_to_expiration"] >= target_dte - tol) &
-            (snapshot["days_to_expiration"] <= target_dte + tol)
-        ].copy()
-
-        if candidates.empty:
-            # Fallback: find nearest available DTE
-            candidates = snapshot.copy()
-
-        # --- 4. Select strike ---
-        available_strikes = candidates["strike"].drop_duplicates()
-        chosen_strike = select_strike(available_strikes, underlying_price, strike_mode)
-
-        if chosen_strike is None:
-            entry_ts += pd.Timedelta(days=7)
-            continue
-
-        # Get the specific put row
-        put_row = candidates[candidates["strike"] == chosen_strike].iloc[0]
-        premium_eth = put_row["mark_price"]          # mark_price is in ETH
-        premium_usd = premium_eth * underlying_price
-        expiry_ts = put_row["expiration_timestamp"]
-        dte = put_row["days_to_expiration"]
-
-        # Fee to sell 1 put (0.03% of underlying, Deribit standard)
-        fee_usd = config.deribit_fee_rate * underlying_price
-        net_premium_usd = premium_usd - fee_usd
-        total_fees += fee_usd
-
-        # --- 5. Find price at expiry ---
-        expiry_snap = df[df["timestamp"] >= expiry_ts]
-        if expiry_snap.empty:
-            # Data ends before expiry — use last available price
-            expiry_price = df["underlying_price"].iloc[-1]
-        else:
-            expiry_price = expiry_snap.iloc[0]["underlying_price"]
-
-        # --- 6. Assignment logic ---
-        assigned = expiry_price < chosen_strike
-
-        if assigned:
-            # We buy ETH at strike price (collateral used)
-            eth_received = cash_balance / chosen_strike  # 1 "unit" worth of ETH
-            eth_total += eth_received
-            assignments += 1
-            cash_balance = net_premium_usd  # reset cash to just the premium earned
-            assignment_note = "ASSIGNED"
-        else:
-            # Keep premium, cash stays intact
-            cash_balance += net_premium_usd
-            assignment_note = "expired worthless"
-
-        total_premiums += net_premium_usd
-
-        portfolio_usd = eth_total * expiry_price + cash_balance
-
-        records.append({
-            "date": actual_entry_ts,
-            "expiry": expiry_ts,
-            "dte": round(dte, 1),
-            "underlying_entry": underlying_price,
-            "underlying_expiry": expiry_price,
-            "strike": chosen_strike,
-            "strike_pct": round(chosen_strike / underlying_price * 100, 1),
-            "premium_usd": round(premium_usd, 2),
-            "fee_usd": round(fee_usd, 4),
-            "net_premium_usd": round(net_premium_usd, 2),
-            "assigned": assigned,
-            "result": assignment_note,
-            "eth_total": eth_total,
-            "cash_balance": round(cash_balance, 2),
-            "total_premiums": round(total_premiums, 2),
-            "portfolio_usd": round(portfolio_usd, 2),
-            "avg_entry_price": round(chosen_strike if assigned else 0, 2),
-        })
-
-        # Next entry: day after expiry
-        entry_ts = expiry_ts + pd.Timedelta(days=1)
-
-    df_out = pd.DataFrame(records)
-    df_out["assignment_rate"] = assignments / max(total_cycles, 1)
-    return df_out
+def print_csp_log(csp_pnl: pd.DataFrame) -> None:
+    print(f"\n=== CSP CYCLE LOG ===")
+    print(f"  Moneyness={STRIKE_MONEYNESS} | DTE={TARGET_DTE}±{DTE_TOLERANCE} | Lot={LOT_SIZE} ETH\n")
+    print(f"  {'Opened':<18} {'Contract':<24} {'Strike':>7} {'Premium$':>9} {'Assigned':>8} {'Spot@Exp':>9} {'Cash':>10} {'ETH':>5} {'Portfolio':>12}")
+    print("  " + "-" * 115)
+    for _, r in csp_pnl.iterrows():
+        print(
+            f"  {r['open_ts'].strftime('%Y-%m-%d %H:%M'):<18} "
+            f"{r['instrument']:<24} "
+            f"{r['strike']:>7.0f} "
+            f"{r['premium_usd']:>9.2f} "
+            f"{'YES' if r['assigned'] else 'no':>8} "
+            f"{r['spot_at_exp']:>9.0f} "
+            f"{r['cash']:>10.2f} "
+            f"{r['eth']:>5.1f} "
+            f"{r['portfolio_value']:>12.2f}"
+        )
 
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def compute_metrics(df: pd.DataFrame, strategy_name: str) -> dict:
-    """Compute summary performance metrics for a strategy."""
-    if df.empty:
-        return {}
-
-    portfolio = df["portfolio_usd"].values
-    returns = np.diff(portfolio) / portfolio[:-1]
-
-    max_dd = 0.0
-    peak = portfolio[0]
-    for v in portfolio:
-        if v > peak:
-            peak = v
-        dd = (peak - v) / peak
-        if dd > max_dd:
-            max_dd = dd
-
-    sharpe = (returns.mean() / returns.std() * np.sqrt(52)) if returns.std() > 0 else 0
-
-    metrics = {
-        "Strategy": strategy_name,
-        "Final ETH": round(df["eth_total"].iloc[-1], 4),
-        "Final portfolio USD": f"${df['portfolio_usd'].iloc[-1]:,.0f}",
-        "Total cash deployed USD": f"${df['cash_spent'].iloc[-1]:,.0f}" if "cash_spent" in df.columns else "N/A",
-        "Total premiums earned USD": f"${df['total_premiums'].iloc[-1]:,.0f}" if "total_premiums" in df.columns else "N/A",
-        "Max drawdown": f"{max_dd*100:.1f}%",
-        "Sharpe ratio (weekly)": round(sharpe, 2),
-        "Assignment rate": f"{df['assignment_rate'].iloc[-1]*100:.0f}%" if "assignment_rate" in df.columns else "N/A",
-        "Avg entry price USD": f"${df['avg_entry_price'].mean():,.0f}" if "avg_entry_price" in df.columns else "N/A",
-    }
-    return metrics
+def print_dca_log(dca_pnl: pd.DataFrame) -> None:
+    print(f"\n=== DCA LOG ({DCA_INTERVAL}, ${DCA_AMOUNT_USD}/purchase) ===\n")
+    print(f"  {'Date':<18} {'Spot':>8} {'ETH bought':>12} {'ETH total':>10} {'Cash':>10} {'Portfolio':>12}")
+    print("  " + "-" * 75)
+    for _, r in dca_pnl.iterrows():
+        print(
+            f"  {r['ts'].strftime('%Y-%m-%d %H:%M'):<18} "
+            f"{r['spot']:>8.0f} "
+            f"{r['eth_bought']:>12.6f} "
+            f"{r['eth']:>10.6f} "
+            f"{r['cash']:>10.2f} "
+            f"{r['portfolio_value']:>12.2f}"
+        )
+    print(f"\n  Total purchases: {len(dca_pnl)}")
 
 
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
+def print_summary(csp_pnl: pd.DataFrame, dca_pnl: pd.DataFrame) -> None:
+    start_val = INITIAL_CAPITAL_USD
 
-def plot_results(dca_df: pd.DataFrame, put_results: dict, output_dir: str):
-    """Generate comparison charts."""
-    os.makedirs(output_dir, exist_ok=True)
+    # CSP: mark-to-market on last bar (includes open position valued at market)
+    real_cycles   = csp_pnl[csp_pnl["instrument"] != "mark-to-market"]
+    w_end   = csp_pnl["portfolio_value"].iloc[-1]
+    w_eth   = csp_pnl["eth"].iloc[-1]
+    w_cash  = csp_pnl["cash"].iloc[-1]
+    w_ret   = (w_end - start_val) / start_val * 100
+    w_prm   = real_cycles["premium_usd"].sum()
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 16))
-    fig.suptitle("ETH Accumulation: DCA vs Put Selling (Deribit)", fontsize=15, fontweight="bold")
+    assigned_rows = real_cycles[real_cycles["assigned"]]
+    w_spent_eth   = (assigned_rows["strike"] * LOT_SIZE).sum() if len(assigned_rows) > 0 else 0
+    w_avg_price   = w_spent_eth / w_eth if w_eth > 0 else 0
 
-    colors = {
-        "DCA": "#4A90D9",
-        "Put ATM": "#E8593C",
-        "Put 10% OTM": "#2ECC71",
-        "Put 20% OTM": "#9B59B6",
-    }
+    # DCA: mark-to-market on last bar
+    d_end   = dca_pnl["portfolio_value"].iloc[-1]
+    d_eth   = dca_pnl["eth"].iloc[-1]
+    d_cash  = dca_pnl["cash"].iloc[-1]
+    d_ret   = (d_end - start_val) / start_val * 100
+    d_spent = INITIAL_CAPITAL_USD - d_cash
+    d_avg   = d_spent / d_eth if d_eth > 0 else 0
 
-    # --- Chart 1: Portfolio value (USD) ---
-    ax1 = axes[0]
-    ax1.plot(dca_df["date"], dca_df["portfolio_usd"], label="DCA", color=colors["DCA"], linewidth=2)
-    for label, df in put_results.items():
-        if not df.empty:
-            ax1.plot(df["date"], df["portfolio_usd"], label=label, color=colors.get(label, "gray"), linewidth=1.5)
-    ax1.set_title("Portfolio Value (USD)", fontsize=12)
-    ax1.set_ylabel("USD")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-
-    # --- Chart 2: ETH accumulated ---
-    ax2 = axes[1]
-    ax2.plot(dca_df["date"], dca_df["eth_total"], label="DCA", color=colors["DCA"], linewidth=2)
-    for label, df in put_results.items():
-        if not df.empty:
-            ax2.plot(df["date"], df["eth_total"], label=label, color=colors.get(label, "gray"), linewidth=1.5)
-    ax2.set_title("ETH Accumulated", fontsize=12)
-    ax2.set_ylabel("ETH")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-
-    # --- Chart 3: Premiums earned (put selling only) ---
-    ax3 = axes[2]
-    for label, df in put_results.items():
-        if not df.empty and "total_premiums" in df.columns:
-            ax3.plot(df["date"], df["total_premiums"], label=label, color=colors.get(label, "gray"), linewidth=1.5)
-    ax3.set_title("Cumulative Premiums Earned (Put Selling)", fontsize=12)
-    ax3.set_ylabel("USD")
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-
-    plt.tight_layout()
-    chart_path = os.path.join(output_dir, "backtest_results.png")
-    plt.savefig(chart_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"\nChart saved → {chart_path}")
+    print("\n" + "=" * 57)
+    print("  BACKTEST RESULTS")
+    print("=" * 57)
+    print(f"  Starting capital:      ${start_val:>10,.2f}")
+    print("-" * 57)
+    print(f"  CASH-SECURED PUT (moneyness={STRIKE_MONEYNESS}, DTE={TARGET_DTE}±{DTE_TOLERANCE})")
+    print(f"    Portfolio value:     ${w_end:>10,.2f}  ({w_ret:+.1f}%)")
+    print(f"    ETH accumulated:      {w_eth:>10.4f}")
+    print(f"    Avg ETH buy price:   ${w_avg_price:>10,.2f}")
+    print(f"    Cash remaining:      ${w_cash:>10,.2f}")
+    print(f"    Total premiums (net):${w_prm:>10,.2f}")
+    print("-" * 57)
+    print(f"  DCA ({DCA_INTERVAL}, ${DCA_AMOUNT_USD}/purchase)")
+    print(f"    Portfolio value:     ${d_end:>10,.2f}  ({d_ret:+.1f}%)")
+    print(f"    ETH accumulated:      {d_eth:>10.4f}")
+    print(f"    Avg ETH buy price:   ${d_avg:>10,.2f}")
+    print(f"    Cash remaining:      ${d_cash:>10,.2f}")
+    print(f"    Spent on ETH:        ${d_spent:>10,.2f}")
+    print("=" * 57)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# STEP 6: CHARTS
+# -----------------------------------------------------------------------------
 
-def main():
-    # -----------------------------------------------------------------------
-    # CONFIGURE HERE — edit these values directly (works in Jupyter & CLI)
-    # -----------------------------------------------------------------------
-    config = BacktestConfig(
-        data_dir          = "./data",
-        weekly_budget_usd = 200.0,
-        expiry_days_target = 7,
-        expiry_days_tolerance = 3,
-        strikes           = ["atm", "otm10", "otm20"],
-        deribit_fee_rate  = 0.0003,
-        output_dir        = "./results",
-        plot              = True,
-    )
-    # -----------------------------------------------------------------------
+def plot_results(csp_pnl: pd.DataFrame, dca_pnl: pd.DataFrame) -> None:
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from matplotlib.lines import Line2D
 
-    # --- Load data ---
-    df = load_data(config)
+    BG       = "#0F1117"
+    BG_AX    = "#161B27"
+    CLR_W    = "#38BDF8"   # CSP — blue
+    CLR_D    = "#F97316"   # DCA — orange
+    CLR_ASN  = "#A78BFA"   # Assigned — purple
+    CLR_ETH  = "#34D399"   # ETH spot — green
+    CLR_GRID = "#1E2533"
+    CLR_BASE = "#4B5563"
+    CLR_TXT  = "#E2E8F0"
+    CLR_SUB  = "#64748B"
 
-    # --- Build weekly price index (for DCA) ---
-    # Use the first observation of each Monday (or nearest available day)
-    price_series = (
-        df.groupby("timestamp")["underlying_price"]
-        .first()
-        .reset_index()
-        .sort_values("timestamp")
-    )
-    price_series = price_series.set_index("timestamp")["underlying_price"]
+    w_ts     = csp_pnl["ts"].dt.tz_localize(None)
+    d_ts     = dca_pnl["ts"].dt.tz_localize(None)
+    assigned = csp_pnl[csp_pnl["assigned"]]
 
-    # Weekly timestamps every 7 days
-    weekly_ts = pd.date_range(
-        start=df["timestamp"].min(),
-        end=df["timestamp"].max(),
-        freq="7D",
-        tz="UTC",
-    )
+    w_ret = (csp_pnl["portfolio_value"].iloc[-1] - INITIAL_CAPITAL_USD) / INITIAL_CAPITAL_USD * 100
+    d_ret = (dca_pnl["portfolio_value"].iloc[-1] - INITIAL_CAPITAL_USD) / INITIAL_CAPITAL_USD * 100
 
-    # Map each weekly_ts to nearest available price
-    all_ts_sorted = price_series.index.sort_values()
-    price_at = {}
-    for wts in weekly_ts:
-        idx = all_ts_sorted.searchsorted(wts)
-        if idx < len(all_ts_sorted):
-            price_at[wts] = price_series.iloc[idx]
+    fig = plt.figure(figsize=(14, 16), facecolor=BG)
+    gs  = fig.add_gridspec(3, 1, hspace=0.45, left=0.08, right=0.94, top=0.93, bottom=0.06)
+    axes = [fig.add_subplot(gs[i]) for i in range(3)]
 
-    # --- Run DCA ---
-    print("\n=== Running DCA backtest ===")
-    dca_df = run_dca(weekly_ts, price_at, config.weekly_budget_usd)
-    print(f"DCA cycles: {len(dca_df)}")
+    fig.text(0.08, 0.965, "Cash-Secured Put vs DCA — ETH Backtest",
+             color=CLR_TXT, fontsize=16, fontweight="bold", va="top")
+    fig.text(0.08, 0.948,
+             f"CSP: moneyness {STRIKE_MONEYNESS}x ATM · DTE {TARGET_DTE}±{DTE_TOLERANCE}d · lot {LOT_SIZE} ETH     "
+             f"DCA: ${DCA_AMOUNT_USD}/{DCA_INTERVAL}     "
+             f"Capital: ${INITIAL_CAPITAL_USD:,}",
+             color=CLR_SUB, fontsize=9, va="top")
 
-    # --- Run Put Selling ---
-    put_results = {}
-    strike_labels = {"atm": "Put ATM", "otm10": "Put 10% OTM", "otm20": "Put 20% OTM"}
+    def style_ax(ax, title, ylabel):
+        ax.set_facecolor(BG_AX)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.tick_params(colors=CLR_SUB, labelsize=8.5)
+        ax.grid(True, color=CLR_GRID, linewidth=0.7, zorder=0)
+        ax.set_axisbelow(True)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=0, ha="center", color=CLR_SUB, fontsize=8.5)
+        ax.text(0, 1.04, title, transform=ax.transAxes,
+                color=CLR_TXT, fontsize=10, fontweight="bold", va="bottom")
+        ax.set_ylabel(ylabel, color=CLR_SUB, fontsize=9)
 
-    for strike_mode in config.strikes:
-        label = strike_labels.get(strike_mode, strike_mode)
-        print(f"\n=== Running Put Selling ({label}) ===")
-        result_df = run_put_selling(df, config, strike_mode)
-        put_results[label] = result_df
-        print(f"Cycles: {len(result_df)}, Assignments: {result_df['assigned'].sum() if not result_df.empty else 0}")
+    # ── 1. Portfolio Value ─────────────────────────────────────────────────────
+    ax = axes[0]
+    style_ax(ax, "Portfolio Value", "USD")
 
-    # --- Summary table ---
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
+    eth_spot = dca_pnl[["ts", "spot"]].copy()
+    eth_spot["ts"] = eth_spot["ts"].dt.tz_localize(None)
+    eth_start = eth_spot["spot"].iloc[0]
+    eth_spot["value"] = eth_spot["spot"] / eth_start * INITIAL_CAPITAL_USD
+    eth_ret = (eth_spot["spot"].iloc[-1] - eth_start) / eth_start * 100
 
-    all_metrics = []
+    ax.axhline(INITIAL_CAPITAL_USD, color=CLR_BASE, linewidth=0.9, linestyle="--", zorder=1)
+    ax.fill_between(w_ts, INITIAL_CAPITAL_USD, csp_pnl["portfolio_value"],
+                    where=csp_pnl["portfolio_value"] >= INITIAL_CAPITAL_USD,
+                    color=CLR_W, alpha=0.08, zorder=1)
+    ax.fill_between(w_ts, INITIAL_CAPITAL_USD, csp_pnl["portfolio_value"],
+                    where=csp_pnl["portfolio_value"] < INITIAL_CAPITAL_USD,
+                    color="#EF4444", alpha=0.08, zorder=1)
 
-    if not dca_df.empty:
-        dca_metrics = compute_metrics(dca_df, "DCA")
-        all_metrics.append(dca_metrics)
+    ax.plot(w_ts, csp_pnl["portfolio_value"], color=CLR_W, linewidth=2.2, zorder=3, solid_capstyle="round")
+    ax.plot(d_ts, dca_pnl["portfolio_value"], color=CLR_D, linewidth=2.2, zorder=3, solid_capstyle="round")
+    ax.plot(eth_spot["ts"], eth_spot["value"], color=CLR_ETH, linewidth=1.5,
+            zorder=2, linestyle="--", alpha=0.85, solid_capstyle="round")
+    ax.scatter(assigned["ts"].dt.tz_localize(None), assigned["portfolio_value"],
+               color=CLR_ASN, s=70, zorder=5, marker="D", linewidths=0)
 
-    for label, res_df in put_results.items():
-        if not res_df.empty:
-            m = compute_metrics(res_df, label)
-            all_metrics.append(m)
+    ax.annotate(f"${csp_pnl['portfolio_value'].iloc[-1]:,.0f}  ({w_ret:+.1f}%)",
+                xy=(w_ts.iloc[-1], csp_pnl["portfolio_value"].iloc[-1]),
+                xytext=(8, 4), textcoords="offset points",
+                color=CLR_W, fontsize=8.5, fontweight="bold", va="center")
+    ax.annotate(f"${dca_pnl['portfolio_value'].iloc[-1]:,.0f}  ({d_ret:+.1f}%)",
+                xy=(d_ts.iloc[-1], dca_pnl["portfolio_value"].iloc[-1]),
+                xytext=(8, -4), textcoords="offset points",
+                color=CLR_D, fontsize=8.5, fontweight="bold", va="center")
+    ax.annotate(f"ETH  ({eth_ret:+.1f}%)",
+                xy=(eth_spot["ts"].iloc[-1], eth_spot["value"].iloc[-1]),
+                xytext=(8, 0), textcoords="offset points",
+                color=CLR_ETH, fontsize=8.5, fontweight="bold", va="center")
 
-    if all_metrics:
-        summary = pd.DataFrame(all_metrics).set_index("Strategy")
-        print(summary.to_string())
+    ax.legend(handles=[
+        Line2D([0], [0], color=CLR_W,    linewidth=2,   label="Cash-Secured Put"),
+        Line2D([0], [0], color=CLR_D,    linewidth=2,   label="DCA"),
+        Line2D([0], [0], color=CLR_ETH,  linewidth=1.5, linestyle="--", label="ETH spot (normalized)"),
+        Line2D([0], [0], color=CLR_ASN,  marker="D", markersize=6, linewidth=0, label="Assigned"),
+        Line2D([0], [0], color=CLR_BASE, linewidth=1,   linestyle="--", label="Capital"),
+    ], fontsize=8.5, framealpha=0, labelcolor=CLR_SUB, loc="upper left")
 
-        os.makedirs(config.output_dir, exist_ok=True)
-        summary_path = os.path.join(config.output_dir, "summary.csv")
-        summary.to_csv(summary_path)
-        print(f"\nSummary saved → {summary_path}")
+    # ── 2. ETH Accumulated ────────────────────────────────────────────────────
+    ax = axes[1]
+    style_ax(ax, "ETH Accumulated", "ETH")
 
-        # Save detailed logs
-        if not dca_df.empty:
-            dca_df.to_csv(os.path.join(config.output_dir, "dca_log.csv"), index=False)
-        for label, res_df in put_results.items():
-            if not res_df.empty:
-                fname = f"puts_{label.replace(' ', '_').lower()}_log.csv"
-                res_df.to_csv(os.path.join(config.output_dir, fname), index=False)
+    ax.fill_between(w_ts, 0, csp_pnl["eth"], step="post", color=CLR_W, alpha=0.12, zorder=1)
+    ax.fill_between(d_ts, 0, dca_pnl["eth"], step="post", color=CLR_D, alpha=0.10, zorder=1)
+    ax.step(w_ts, csp_pnl["eth"], color=CLR_W, linewidth=2.2, where="post", zorder=3)
+    ax.step(d_ts, dca_pnl["eth"], color=CLR_D, linewidth=2.2, where="post", zorder=3)
+    ax.scatter(assigned["ts"].dt.tz_localize(None), assigned["eth"],
+               color=CLR_ASN, s=70, zorder=5, marker="D", linewidths=0)
 
-    # --- Plot ---
-    if config.plot and not dca_df.empty:
-        plot_results(dca_df, put_results, config.output_dir)
+    ax.annotate(f"{csp_pnl['eth'].iloc[-1]:.3f} ETH",
+                xy=(w_ts.iloc[-1], csp_pnl["eth"].iloc[-1]),
+                xytext=(8, 0), textcoords="offset points",
+                color=CLR_W, fontsize=8.5, fontweight="bold", va="center")
+    ax.annotate(f"{dca_pnl['eth'].iloc[-1]:.4f} ETH",
+                xy=(d_ts.iloc[-1], dca_pnl["eth"].iloc[-1]),
+                xytext=(8, -10), textcoords="offset points",
+                color=CLR_D, fontsize=8.5, fontweight="bold", va="center")
 
-    print("\nDone!")
+    # ── 3. Cash Remaining ─────────────────────────────────────────────────────
+    ax = axes[2]
+    style_ax(ax, "Cash Remaining", "USD")
 
+    ax.fill_between(w_ts, 0, csp_pnl["cash"], color=CLR_W, alpha=0.10, zorder=1)
+    ax.fill_between(d_ts, 0, dca_pnl["cash"], color=CLR_D, alpha=0.08, zorder=1)
+    ax.plot(w_ts, csp_pnl["cash"], color=CLR_W, linewidth=2.2, zorder=3)
+    ax.plot(d_ts, dca_pnl["cash"], color=CLR_D, linewidth=2.2, zorder=3)
+    ax.axhline(0, color="#EF4444", linewidth=0.7, linestyle=":", zorder=2)
+
+    ax.annotate(f"${csp_pnl['cash'].iloc[-1]:,.0f}",
+                xy=(w_ts.iloc[-1], csp_pnl["cash"].iloc[-1]),
+                xytext=(8, 0), textcoords="offset points",
+                color=CLR_W, fontsize=8.5, fontweight="bold", va="center")
+    ax.annotate(f"${dca_pnl['cash'].iloc[-1]:,.0f}",
+                xy=(d_ts.iloc[-1], dca_pnl["cash"].iloc[-1]),
+                xytext=(8, 0), textcoords="offset points",
+                color=CLR_D, fontsize=8.5, fontweight="bold", va="center")
+
+    out_path = DATA_DIR / "backtest_results.png"
+    plt.savefig(out_path, dpi=180, bbox_inches="tight", facecolor=BG)
+    print(f"\nChart saved: {out_path}")
+    plt.show()
+
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    print("=== STEP 1: LOADING DATA ===\n")
+    puts = load_puts_only(DATA_FILES)
+    get_expiry_schedule(puts)
+
+    print("\n  Loading spot series for DCA...")
+    spot_series = load_spot_series(DATA_FILES)
+
+    print("\n=== STEP 2: CASH-SECURED PUT P&L ===")
+    csp_pnl = build_csp_pnl(puts, spot_series)
+    print_csp_log(csp_pnl)
+
+    print("\n=== STEP 3: DCA P&L ===")
+    dca_pnl = calc_dca_pnl(spot_series)
+    print_dca_log(dca_pnl)
+
+    print_summary(csp_pnl, dca_pnl)
+
+    plot_results(csp_pnl, dca_pnl)
+
+    print("\n✓ Done.")
